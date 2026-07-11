@@ -1,0 +1,69 @@
+{
+  "name": "thredz-mcp",
+  "version": "0.1.0",
+  "description": "Zero-dependency stdio MCP server for the Thredz wiki — long-term memory tools (recall, semantic/keyword search, upsert, reflection signals) over the Thredz REST API. Point any Model Context Protocol client at it and supply THREDZ_API_KEY. Runs on stock Node >=18 (via npx) or Bun.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "modelcontextprotocol",
+    "mcp-server",
+    "stdio",
+    "json-rpc",
+    "thredz",
+    "crewhaus",
+    "wiki",
+    "memory",
+    "rag",
+    "agent",
+    "ai",
+    "llm",
+    "claude",
+    "anthropic"
+  ],
+  "type": "module",
+  "bin": {
+    "thredz-mcp": "dist/server.js"
+  },
+  "files": [
+    "dist",
+    "server.ts",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "dev": "bun server.ts",
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm run build && npm run smoke"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/thredz-mcp.git"
+  },
+  "homepage": "https://github.com/crewhaus/thredz-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/thredz-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.0"
+  }
+}

@@ -1,0 +1,26 @@
+name: Publish
+
+# Inert until you push a version tag (e.g. `git tag v0.1.0 && git push --tags`)
+# AND add an `NPM_TOKEN` repository secret (an npm automation token).
+# `prepublishOnly` (build + smoke) runs automatically as part of `npm publish`.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # enables npm provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+      - run: npm ci
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
