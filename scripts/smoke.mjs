@@ -28,6 +28,7 @@ const EXPECTED_TOOLS = [
   "log_knowledge_gap",
   // Agent-to-agent messaging
   "agent_register",
+  "agent_update",
   "agent_list",
   "message_send",
   "inbox_poll",
@@ -82,6 +83,10 @@ child.on("close", (code) => {
   const names = (list?.result?.tools ?? []).map((t) => t.name);
   const missing = EXPECTED_TOOLS.filter((t) => !names.includes(t));
   if (missing.length) return fail(`tools/list missing: ${missing.join(", ")}`);
+  // Catch drift in the other direction too — an advertised tool not in the
+  // expected set means the publish gate is no longer verifying the full surface.
+  const unexpected = names.filter((t) => !EXPECTED_TOOLS.includes(t));
+  if (unexpected.length) return fail(`tools/list has unlisted tools (add to EXPECTED_TOOLS): ${unexpected.join(", ")}`);
 
   console.error(`smoke: OK — initialize + tools/list (${names.length} tools), stdout is pure JSON-RPC`);
   process.exit(0);
