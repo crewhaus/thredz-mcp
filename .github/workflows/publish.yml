@@ -21,6 +21,18 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: npm
       - run: npm ci
-      - run: npm publish --provenance --access public
+      # Idempotent: a re-pushed tag (or a version already published manually)
+      # skips the publish instead of failing on npm's duplicate-version 403.
+      - id: check
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "thredz-mcp@${VERSION}" version >/dev/null 2>&1; then
+            echo "already published thredz-mcp@${VERSION} — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.check.outputs.skip != 'true'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
