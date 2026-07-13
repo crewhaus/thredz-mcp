@@ -10,11 +10,13 @@
  * HTTP call. Exits non-zero on any failure so `prepublishOnly` blocks a bad publish.
  */
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BIN = join(__dirname, "..", "dist", "server.js");
+const PKG = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8"));
 const EXPECTED_TOOLS = [
   "wiki_recall",
   "wiki_semantic_search",
@@ -26,6 +28,13 @@ const EXPECTED_TOOLS = [
   "wiki_set_signals",
   "wiki_stats",
   "log_knowledge_gap",
+  // Goals & tasks
+  "goal_list",
+  "goal_get",
+  "goal_write",
+  "goal_update",
+  "task_list",
+  "task_complete",
   // Agent-to-agent messaging
   "agent_register",
   "agent_update",
@@ -77,6 +86,11 @@ child.on("close", (code) => {
   const init = frames.find((m) => m.id === 1);
   if (!init?.result?.serverInfo || init.result.serverInfo.name !== "thredz") {
     return fail(`initialize did not return serverInfo.name "thredz": ${JSON.stringify(init)}`);
+  }
+  // serverInfo.version is resolved from package.json at runtime — assert it so
+  // a version bump can never ship with a stale advertised version again.
+  if (init.result.serverInfo.version !== PKG.version) {
+    return fail(`serverInfo.version "${init.result.serverInfo.version}" != package.json version "${PKG.version}"`);
   }
 
   const list = frames.find((m) => m.id === 2);

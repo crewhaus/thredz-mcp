@@ -19,6 +19,14 @@
  *   stats   →  GET  /wiki/stats              (corpus health)
  *   gap     →  POST /tasks                    (log a knowledge gap as a Thredz task)
  *
+ * Goals & tasks (durable cross-session plans; the CrewHaus continuity backend):
+ *   goal_list      →  GET  /goals                    (pick up objectives at session start)
+ *   goal_get       →  GET  /goals/{id}               (single-element-array quirk unwrapped)
+ *   goal_write     →  POST /goals                    (create; carries an Idempotency-Key)
+ *   goal_update    →  PUT  /goals/{id} | /goals/{id}/increase|decrease
+ *   task_list      →  GET  /tasks                    (tag=knowledge-gap = the study queue)
+ *   task_complete  →  PUT  /tasks/{id}/complete
+ *
  * Agent-to-agent messaging (talk to agents in other harnesses/accounts):
  *   agent_register →  POST   /agents                          (get-or-create your handle)
  *   agent_update   →  PATCH  /agents/{handle}                 (change profile/privacy after creation)
@@ -32,15 +40,44 @@
  *
  * Config (read from the environment — set these in your MCP client's server
  * definition, e.g. the `env` block of a claude_desktop_config.json entry):
- *   THREDZ_API_KEY   required — a Bearer key with a wiki grant
- *   THREDZ_API_BASE  optional — default https://thredz.crewhaus.ai/api
+ *   THREDZ_API_KEY             required — a Bearer key with a wiki grant
+ *   THREDZ_API_BASE            optional — default https://thredz.crewhaus.ai/api
+ *   THREDZ_DEFAULT_VISIBILITY  optional — visibility for NEW articles created by
+ *                              wiki_write: private (default) | shared. Thredz's
+ *                              own API defaults to shared (readable by every
+ *                              account); this server defaults to private so
+ *                              agent memory is never public by accident.
  *
  * IMPORTANT: stdout carries ONLY JSON-RPC frames. Everything diagnostic goes
  * to stderr, or the MCP handshake breaks.
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const API_BASE = (process.env.THREDZ_API_BASE ?? "https://thredz.crewhaus.ai/api").replace(/\/+$/, "");
 const API_KEY = process.env.THREDZ_API_KEY ?? "";
+
+// Safe-by-default: the Thredz API itself defaults new articles to "shared"
+// (readable by EVERY Thredz account). Agent memory must be private unless the
+// caller explicitly opts out per write or via THREDZ_DEFAULT_VISIBILITY.
+const DEFAULT_VISIBILITY = process.env.THREDZ_DEFAULT_VISIBILITY === "shared" ? "shared" : "private";
+
+// Resolved from package.json so serverInfo can never drift from the published
+// version again. Works from the built bin (dist/server.js — package.json one
+// level up) and from source (server.ts at the repo root).
+const VERSION = (() => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const rel of ["package.json", join("..", "package.json")]) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(here, rel), "utf8")) as { name?: string; version?: string };
+      if (pkg.name === "thredz-mcp" && pkg.version) return pkg.version;
+    } catch {
+      /* try the next location */
+    }
+  }
+  return "0.0.0";
+})();
 
 const log = (...a: unknown[]) => process.stderr.write(`[thredz-mcp] ${a.join(" ")}\n`);
 
@@ -55,12 +92,13 @@ function cryptoRandomId(): string {
 
 // ── HTTP helper ────────────────────────────────────────────────────────────
 type Json = Record<string, unknown>;
+type ThredzResponse = { ok: boolean; status: number; data: unknown; retryAfter?: string | null };
 
 async function thredz(
   method: string,
   path: string,
   opts: { query?: Record<string, unknown>; body?: Json; headers?: Record<string, string> } = {},
-): Promise<{ ok: boolean; status: number; data: unknown }> {
+): Promise<ThredzResponse> {
   if (!API_KEY) {
     return { ok: false, status: 0, data: { error: "THREDZ_API_KEY is not set — set it in your MCP client's env for this server" } };
   }
@@ -92,16 +130,40 @@ async function thredz(
   } catch {
     /* leave as text */
   }
-  return { ok: res.ok, status: res.status, data };
+  return { ok: res.ok, status: res.status, data, retryAfter: res.headers.get("retry-after") };
 }
 
 // ── Tool implementations ────────────────────────────────────────────────────
 type ToolResult = { text: string; isError?: boolean };
 
-function present(label: string, r: { ok: boolean; status: number; data: unknown }): ToolResult {
+// Map the Thredz failure surface onto actionable text, so a billing lapse or a
+// plan cap never reaches the model as a bare HTTP status. The raw response
+// body is still appended below the remediation line for debugging.
+function remediation(r: ThredzResponse): string | null {
+  const obj = (typeof r.data === "object" && r.data !== null ? r.data : {}) as Json;
+  const err = typeof obj.error === "string" ? obj.error : "";
+  const code = typeof obj.code === "string" ? obj.code : "";
+  if (r.status === 0) return null; // network / missing-key errors already explain themselves
+  if (r.status === 401) return "no API key reached Thredz — set THREDZ_API_KEY in this MCP server's env";
+  if (r.status === 403 && /disabled/i.test(err))
+    return "this Thredz API key is disabled — usually a lapsed subscription. Fix billing at https://thredz.crewhaus.ai (Account → Billing); the agent keeps running, but Thredz-backed memory is unavailable until the key is re-enabled";
+  if (r.status === 403 && /^wiki_(access|permission)_required$/.test(code))
+    return "this key has no (or too low a) wiki grant — give it read-write wiki access in the Thredz account portal";
+  if (r.status === 403) return "Thredz rejected this API key — check THREDZ_API_KEY for typos or regenerate the key";
+  if (r.status === 402 && code === "quota_exceeded")
+    return "Thredz plan limit reached — the write was NOT saved. Upgrade the plan (or clear unused items) at https://thredz.crewhaus.ai";
+  if (r.status === 402) return "this capability needs a higher Thredz plan — see https://thredz.crewhaus.ai";
+  if (r.status === 429) return `Thredz rate limit hit — retry after ${r.retryAfter ?? "a few"} seconds`;
+  if (r.status === 409 && code === "stale_article_version")
+    return "the article changed under you (stale version) — re-read it with wiki_get, then re-apply your edit";
+  return null;
+}
+
+function present(label: string, r: ThredzResponse): ToolResult {
   const body = typeof r.data === "string" ? r.data : JSON.stringify(r.data, null, 2);
-  if (!r.ok) return { text: `${label} failed (HTTP ${r.status}):\n${body}`, isError: true };
-  return { text: body };
+  if (r.ok) return { text: body };
+  const fix = remediation(r);
+  return { text: `${label} failed (HTTP ${r.status})${fix ? ` — ${fix}` : ""}:\n${body}`, isError: true };
 }
 
 const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
@@ -131,6 +193,8 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
   async wiki_write(a) {
     const slug = String(a.slug ?? "").trim();
     if (!slug) return { text: "wiki_write requires a `slug`", isError: true };
+    const explicitVisibility =
+      a.visibility === "private" || a.visibility === "shared" ? (a.visibility as string) : undefined;
     const fields: Json = {
       title: a.title,
       slug,
@@ -149,16 +213,22 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
     if (existing.ok) {
       // The article may be returned bare or wrapped as { article: {...} };
       // `version` is required for the PATCH optimistic-concurrency check.
+      // Visibility is only sent when the caller explicitly asked to change it —
+      // an update must never silently flip an article public or private.
       const doc = (existing.data as Json) ?? {};
       const art = ((doc.article as Json) ?? doc) as Json;
       const version = art.version;
       const r = await thredz("PATCH", `/wiki/articles/${encodeURIComponent(slug)}`, {
-        body: { ...fields, version },
+        body: { ...fields, ...(explicitVisibility ? { visibility: explicitVisibility } : {}), version },
       });
       return present(`wiki_write (updated ${slug})`, r);
     }
-    const r = await thredz("POST", "/wiki/articles", { body: fields });
-    return present(`wiki_write (created ${slug})`, r);
+    // Creates always carry a visibility: caller's choice, else the server-safe
+    // default (private) — never the Thredz API's shared-by-default.
+    const r = await thredz("POST", "/wiki/articles", {
+      body: { ...fields, visibility: explicitVisibility ?? DEFAULT_VISIBILITY },
+    });
+    return present(`wiki_write (created ${slug}, ${explicitVisibility ?? DEFAULT_VISIBILITY})`, r);
   },
 
   // --- Reflection helpers ---
@@ -204,6 +274,85 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
       },
     });
     return present("log_knowledge_gap", r);
+  },
+
+  // --- Goals & tasks (durable cross-session plans) ---
+  async goal_list(a) {
+    const r = await thredz("GET", "/goals", { query: { graph: a.graph, tag: a.tag, overdue: a.overdue } });
+    return present("goal_list", r);
+  },
+  async goal_get(a) {
+    const id = String(a.id ?? "").trim();
+    if (!id) return { text: "goal_get requires an `id`", isError: true };
+    const r = await thredz("GET", `/goals/${encodeURIComponent(id)}`);
+    // GET /goals/{id} returns a single-element array (documented historical
+    // quirk) — unwrap so callers always see one goal object.
+    if (r.ok && Array.isArray(r.data) && r.data.length === 1) r.data = r.data[0];
+    return present("goal_get", r);
+  },
+  async goal_write(a) {
+    const title = String(a.title ?? "").trim();
+    if (!title) return { text: "goal_write requires a `title`", isError: true };
+    const idempotencyKey = a.idempotencyKey ? String(a.idempotencyKey) : cryptoRandomId();
+    const r = await thredz("POST", "/goals", {
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: {
+        title,
+        description: a.description,
+        targetValue: a.targetValue,
+        currentValue: a.currentValue,
+        increment: a.increment,
+        healthMode: a.healthMode,
+        deadline: a.deadline,
+        tags: a.tags,
+        graph: a.graph,
+        weight: a.weight,
+      },
+    });
+    return present("goal_write", r);
+  },
+  async goal_update(a) {
+    const id = String(a.id ?? "").trim();
+    if (!id) return { text: "goal_update requires an `id`", isError: true };
+    if (a.progress === "increase" || a.progress === "decrease") {
+      // Atomic but NOT idempotent — a retried call moves the value twice.
+      const r = await thredz("PUT", `/goals/${encodeURIComponent(id)}/${a.progress}`);
+      return present(`goal_update (${a.progress})`, r);
+    }
+    const body: Json = {};
+    for (const f of ["title", "description", "targetValue", "currentValue", "increment", "healthMode", "health", "deadline", "tags", "weight"]) {
+      if (a[f] !== undefined) body[f] = a[f];
+    }
+    if (Object.keys(body).length === 0) {
+      return {
+        text: "goal_update needs `progress` ('increase' | 'decrease') or at least one field to change",
+        isError: true,
+      };
+    }
+    const r = await thredz("PUT", `/goals/${encodeURIComponent(id)}`, { body });
+    return present("goal_update", r);
+  },
+  async task_list(a) {
+    const r = await thredz("GET", "/tasks", {
+      query: {
+        status: a.status,
+        priority: a.priority,
+        tag: a.tag,
+        goal: a.goal,
+        overdue: a.overdue,
+        sortBy: a.sortBy,
+        sortDir: a.sortDir,
+        limit: a.limit,
+        page: a.page,
+      },
+    });
+    return present("task_list", r);
+  },
+  async task_complete(a) {
+    const id = String(a.id ?? "").trim();
+    if (!id) return { text: "task_complete requires an `id`", isError: true };
+    const r = await thredz("PUT", `/tasks/${encodeURIComponent(id)}/complete`);
+    return present("task_complete", r);
   },
 
   // --- Agent-to-agent messaging ---
@@ -377,9 +526,13 @@ const TOOLS = [
         status: str("draft | published | review | archived (default published)"),
         confidenceScore: num("0–1 confidence in this knowledge"),
         editMessage: str("what changed and why"),
+        visibility: str(
+          "'private' (default — scoped to your account; correct for agent memory) | 'shared' (readable by EVERY Thredz account — only for deliberately public knowledge). On updates, omitting this leaves the article's visibility unchanged.",
+        ),
       },
       ["slug", "title", "body"],
     ),
+    annotations: { title: "Write wiki article", destructiveHint: true },
   },
   {
     name: "wiki_list",
@@ -416,6 +569,87 @@ const TOOLS = [
     description:
       "Record a knowledge gap as a Thredz task when the expert could NOT confidently answer. These gaps become the highest-priority items for the next study pass — this is how the expert learns WHAT to learn.",
     inputSchema: s({ topic: str("the topic the expert was weak on"), detail: str("what specifically was missing"), tags: { type: "array", items: { type: "string" } }, priority: str("low | medium | high") }, ["topic"]),
+  },
+
+  // --- Goals & tasks (durable cross-session plans) ---
+  {
+    name: "goal_list",
+    description:
+      "List your goals (filters: graph, tag, overdue). Call at session start to pick up durable objectives from previous sessions — goals are the cross-session plan surface, so a fresh session knows what it is working toward.",
+    inputSchema: s({ graph: str("graph id to filter by"), tag: str("tag filter"), overdue: bool("only overdue goals") }),
+  },
+  {
+    name: "goal_get",
+    description: "Fetch one goal by id, with read-time health and the overdue flag. Returns a single goal object.",
+    inputSchema: s({ id: str("goal id") }, ["id"]),
+  },
+  {
+    name: "goal_write",
+    description:
+      "Create a durable goal. Only `title` is required; set `targetValue` if you want measurable progress — the goal auto-completes (completedAt stamps) when currentValue reaches it.",
+    inputSchema: s(
+      {
+        title: str("goal name"),
+        description: str("what done looks like"),
+        targetValue: num("completion threshold (enables auto-complete + progress health)"),
+        currentValue: num("starting progress (default 0)"),
+        increment: num("step size for increase/decrease (default 1)"),
+        healthMode: str("'manual' | 'progress' | 'auto' (default manual)"),
+        deadline: str("ISO date — drives the overdue flag"),
+        tags: { type: "array", items: { type: "string" }, description: "filterable labels" },
+        graph: str("graph id to attach the goal to"),
+        weight: num("importance in graph-health rollups"),
+        idempotencyKey: str("stable key so a retried create can't duplicate (auto-generated if omitted)"),
+      },
+      ["title"],
+    ),
+    annotations: { title: "Create goal", destructiveHint: true },
+  },
+  {
+    name: "goal_update",
+    description:
+      "Update a goal. Pass progress: 'increase' | 'decrease' to atomically move currentValue by the goal's increment (auto-completes at targetValue; atomic but NOT idempotent — never blind-retry it). Otherwise pass the fields to change.",
+    inputSchema: s(
+      {
+        id: str("goal id"),
+        progress: str("'increase' | 'decrease' — atomic step; when set, other fields are ignored"),
+        title: str("new title"),
+        description: str("new description"),
+        targetValue: num("new completion threshold"),
+        currentValue: num("set progress directly (prefer progress:'increase' for atomic moves)"),
+        increment: num("new step size"),
+        healthMode: str("'manual' | 'progress' | 'auto'"),
+        health: num("stored health 0–1 (manual mode only)"),
+        deadline: str("ISO date"),
+        tags: { type: "array", items: { type: "string" } },
+        weight: num("importance in graph-health rollups"),
+      },
+      ["id"],
+    ),
+    annotations: { title: "Update goal", destructiveHint: true },
+  },
+  {
+    name: "task_list",
+    description:
+      "List tasks with filters. `tag: 'knowledge-gap'` returns the study gaps recorded by log_knowledge_gap — the study loop reads these to decide WHAT to learn next. Statuses: todo | in-progress | blocked | in-review | done | cancelled.",
+    inputSchema: s({
+      status: str("status filter"),
+      priority: str("'critical' | 'high' | 'medium' | 'low' (exact filter — priority sorts alphabetically, don't sort by it)"),
+      tag: str("tag filter, e.g. knowledge-gap"),
+      goal: str("only tasks linked to this goal id"),
+      overdue: bool("only overdue tasks"),
+      sortBy: str("createdAt | updatedAt | deadline | status | title"),
+      sortDir: str("asc | desc"),
+      limit: num("page size"),
+      page: num("page number"),
+    }),
+  },
+  {
+    name: "task_complete",
+    description:
+      "Mark a task done (sets status:done + completedAt and updates any linked goal's auto health). The canonical way to close a knowledge gap after studying it.",
+    inputSchema: s({ id: str("task id") }, ["id"]),
+    annotations: { title: "Complete task", destructiveHint: true },
   },
 
   // --- Agent-to-agent messaging ---
@@ -552,7 +786,7 @@ async function handle(msg: Json): Promise<void> {
       reply(id, {
         protocolVersion: clientProto,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "thredz", version: "0.1.0" },
+        serverInfo: { name: "thredz", version: VERSION },
       });
       return;
     }

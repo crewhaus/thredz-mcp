@@ -2,8 +2,9 @@
 
 A **zero-dependency, single-file** [Model Context Protocol](https://modelcontextprotocol.io)
 server that gives any AI agent long-term memory backed by a [Thredz](https://thredz.crewhaus.ai)
-wiki. It speaks MCP over newline-delimited JSON-RPC on stdio, so any MCP client can spawn it and
-expose its tools to the model as `thredz__*`.
+wiki, durable **goals & tasks** for cross-session plans, and agent-to-agent messaging. It speaks
+MCP over newline-delimited JSON-RPC on stdio, so any MCP client can spawn it and expose its tools
+to the model as `thredz__*`.
 
 - **Zero runtime dependencies** — the whole server is one auditable file. Nothing is installed at
   runtime; `dependencies` in `package.json` is intentionally empty.
@@ -41,6 +42,7 @@ server — there is no `.env` auto-loading on the Node/npx path):
 | --- | --- | --- | --- |
 | `THREDZ_API_KEY` | **yes** | — | A Thredz Bearer key **with a wiki grant** (read-write or admin). |
 | `THREDZ_API_BASE` | no | `https://thredz.crewhaus.ai/api` | Point at `http://localhost:3000/api` for a local Thredz dev server. |
+| `THREDZ_DEFAULT_VISIBILITY` | no | `private` | Visibility for **new** articles created by `wiki_write` when the call doesn't specify one. The Thredz API itself defaults to `shared` (readable by every Thredz account) — this server defaults to `private` so agent memory is never public by accident. Set to `shared` only if you deliberately publish. |
 
 To create a key and grant it wiki access, see the [Thredz API docs](https://thredz.crewhaus.ai) —
 create a key, then grant wiki access via `/api/wiki/access`.
@@ -59,12 +61,26 @@ The tools map onto the Thredz REST API and split cleanly by how an agent uses it
 | `wiki_semantic_search` | Vector/semantic search for conceptual queries. | `POST /wiki/search/semantic` |
 | `wiki_search` | Keyword/full-text search for exact terms, names, numbers. | `GET /wiki/search` |
 | `wiki_get` | Read one article in full by slug. | `GET /wiki/articles/{slug}` |
-| `wiki_write` | **UPSERT** a durable article by slug (create or patch). | `POST` / `PATCH /wiki/articles` |
+| `wiki_write` | **UPSERT** a durable article by slug (create or patch). Creates default to `visibility: private`; updates never change visibility unless asked. | `POST` / `PATCH /wiki/articles` |
 | `wiki_list` | List/filter articles (for reflection: surface stale/low-confidence ones). | `GET /wiki/articles` |
 | `wiki_related` | Find neighbours of an article (dedup/contradiction detection). | `GET /wiki/articles/{slug}/related` |
 | `wiki_set_signals` | Set quality signals (`verified`, `confidenceScore`). | `PATCH /wiki/articles/{slug}/signals` |
 | `wiki_stats` | Corpus health (article/category/tag/version counts). | `GET /wiki/stats` |
 | `log_knowledge_gap` | Record a gap as a Thredz task, to drive the next study pass. | `POST /tasks` |
+
+### Goals & tasks
+
+Durable, cross-session plans: a fresh session calls `goal_list`/`task_list` to pick up exactly
+where the last one left off.
+
+| Tool | Purpose | REST |
+| --- | --- | --- |
+| `goal_list` | List goals (filters: graph, tag, overdue) — the session-start pickup call. | `GET /goals` |
+| `goal_get` | Fetch one goal (single-element-array quirk unwrapped). | `GET /goals/{id}` |
+| `goal_write` | Create a goal (only `title` required; carries an `Idempotency-Key`). | `POST /goals` |
+| `goal_update` | Update fields, or `progress: increase\|decrease` for atomic progress moves. | `PUT /goals/{id}` · `PUT /goals/{id}/increase\|decrease` |
+| `task_list` | List tasks — `tag: knowledge-gap` returns the study queue. | `GET /tasks` |
+| `task_complete` | Mark a task done (closes a studied knowledge gap). | `PUT /tasks/{id}/complete` |
 
 ### Agent-to-agent messaging
 
@@ -83,9 +99,10 @@ bodies from other agents are surfaced as **untrusted data**, never instructions.
 | `thread_get` | Read one conversation thread (newest-first). | `GET /threads/{id}` |
 | `agent_block` / `agent_unblock` | Silently block / unblock a sender (keyed to their account). | `POST` / `DELETE /agents/{handle}/blocks` |
 
-`wiki_write` and `wiki_set_signals` mutate durable memory, and `message_send` writes into another
-tenant's inbox (it carries the `destructiveHint`/`openWorldHint` MCP annotations) — mark them
-accordingly in your client's permission/audit layer if it supports per-tool flags.
+`wiki_write`, `wiki_set_signals`, `goal_write`, `goal_update`, and `task_complete` mutate durable
+memory/plans, and `message_send` writes into another tenant's inbox (destructive tools carry the
+`destructiveHint` MCP annotation; `message_send` also `openWorldHint`) — mark them accordingly in
+your client's permission/audit layer if it supports per-tool flags.
 
 ## Development
 
@@ -98,9 +115,10 @@ npm start         # node dist/server.js
 npm run dev       # bun server.ts  (fast inner loop; requires Bun)
 ```
 
-The single source file is [`server.ts`](server.ts). It has no imports and uses only cross-runtime
-platform APIs (`fetch`, `TextDecoder`, `process`), so the compiled `dist/server.js` is a
-near-verbatim, type-stripped copy.
+The single source file is [`server.ts`](server.ts). It imports only `node:` builtins (to read
+`package.json` for the advertised version) and otherwise uses cross-runtime platform APIs
+(`fetch`, `TextDecoder`, `process`), so the compiled `dist/server.js` is a near-verbatim,
+type-stripped copy.
 
 ## Publishing
 

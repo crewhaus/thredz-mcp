@@ -1,7 +1,7 @@
 {
   "name": "thredz-mcp",
-  "version": "0.1.0",
-  "description": "Zero-dependency stdio MCP server for the Thredz wiki — long-term memory tools (recall, semantic/keyword search, upsert, reflection signals) over the Thredz REST API. Point any Model Context Protocol client at it and supply THREDZ_API_KEY. Runs on stock Node >=18 (via npx) or Bun.",
+  "version": "0.2.0",
+  "description": "Zero-dependency stdio MCP server for Thredz \u2014 long-term memory (wiki recall, semantic/keyword search, upsert, reflection signals), durable goals & tasks, and agent-to-agent messaging over the Thredz REST API. Point any Model Context Protocol client at it and supply THREDZ_API_KEY. Runs on stock Node >=18 (via npx) or Bun.",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -18,7 +18,10 @@
     "ai",
     "llm",
     "claude",
-    "anthropic"
+    "anthropic",
+    "goals",
+    "tasks",
+    "planning"
   ],
   "type": "module",
   "bin": {
