@@ -27,6 +27,9 @@ const EXPECTED_TOOLS = [
   "wiki_related",
   "wiki_set_signals",
   "wiki_stats",
+  // Spaces (Pro/Scale)
+  "wiki_space_list",
+  "wiki_space_create",
   "log_knowledge_gap",
   // Goals & tasks
   "goal_list",

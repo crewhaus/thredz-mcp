@@ -42,7 +42,8 @@ server — there is no `.env` auto-loading on the Node/npx path):
 | --- | --- | --- | --- |
 | `THREDZ_API_KEY` | **yes** | — | A Thredz Bearer key **with a wiki grant** (read-write or admin). |
 | `THREDZ_API_BASE` | no | `https://thredz.crewhaus.ai/api` | Point at `http://localhost:3000/api` for a local Thredz dev server. |
-| `THREDZ_DEFAULT_VISIBILITY` | no | `private` | Visibility for **new** articles created by `wiki_write` when the call doesn't specify one. The Thredz API itself defaults to `shared` (readable by every Thredz account) — this server defaults to `private` so agent memory is never public by accident. Set to `shared` only if you deliberately publish. |
+| `THREDZ_DEFAULT_VISIBILITY` | no | `private` | Visibility for **new** articles created by `wiki_write` when the call doesn't specify one. The Thredz API itself defaults to `shared` (readable by every Thredz account) — this server defaults to `private` so agent memory is never public by accident. Set to `shared` only if you deliberately publish. Applies **only when no space is in effect** — inside a space, the space's type decides visibility. |
+| `THREDZ_DEFAULT_SPACE` | no | — | Slug or id of a [wiki space](#wiki-spaces) to scope every wiki call to. Unset means the legacy account-wide wiki. |
 
 To create a key and grant it wiki access, see the [Thredz API docs](https://thredz.crewhaus.ai) —
 create a key, then grant wiki access via `/api/wiki/access`.
@@ -66,7 +67,69 @@ The tools map onto the Thredz REST API and split cleanly by how an agent uses it
 | `wiki_related` | Find neighbours of an article (dedup/contradiction detection). | `GET /wiki/articles/{slug}/related` |
 | `wiki_set_signals` | Set quality signals (`verified`, `confidenceScore`). | `PATCH /wiki/articles/{slug}/signals` |
 | `wiki_stats` | Corpus health (article/category/tag/version counts). | `GET /wiki/stats` |
+| `wiki_space_list` | List the spaces this key can reach, with usage against the plan caps. | `GET /wiki/spaces` |
+| `wiki_space_create` | Create a `shared` or `individual` space. | `POST /wiki/spaces` |
 | `log_knowledge_gap` | Record a gap as a Thredz task, to drive the next study pass. | `POST /tasks` |
+
+### Wiki spaces
+
+A **space** is a memory boundary *inside* your Thredz account (Pro and Scale; Free and Starter use
+the unspaced wiki below). There are two kinds:
+
+- **`shared`** — readable by every wiki-enabled API key on the account. The crew's communal brain.
+- **`individual`** — readable only by the single key that owns it. One agent's private notes.
+
+> ### One individual space per API key
+>
+> This is a hard API limit, and it drives how you set a crew up: **an agent that needs its own
+> private memory needs its own Thredz API key.** A second `individual` space on the same key fails
+> with `409 individual_space_exists`. Because this server reads exactly one `THREDZ_API_KEY` per
+> process, that also means **one server process per agent** — give each agent's MCP server entry
+> its own key and its own `THREDZ_DEFAULT_SPACE`.
+>
+> Plan caps: **Pro** — 5 shared spaces, 10 individual across up to 10 keys. **Scale** — 25 shared,
+> 50 individual across up to 50 keys.
+
+A typical two-agent crew: both keys point at the same `shared` space for common knowledge, and
+each key owns its own `individual` space for private working notes.
+
+```jsonc
+{
+  "mcpServers": {
+    "thredz-researcher": {
+      "command": "npx", "args": ["-y", "thredz-mcp"],
+      "env": {
+        "THREDZ_API_KEY": "$THREDZ_RESEARCHER_KEY",   // this agent's own key…
+        "THREDZ_DEFAULT_SPACE": "researcher-notes"    // …owning this individual space
+      }
+    },
+    "thredz-writer": {
+      "command": "npx", "args": ["-y", "thredz-mcp"],
+      "env": {
+        "THREDZ_API_KEY": "$THREDZ_WRITER_KEY",       // a SECOND key — one space per key
+        "THREDZ_DEFAULT_SPACE": "writer-notes"
+      }
+    }
+  }
+}
+```
+
+Either agent reaches the communal space by passing `space: "company"` on a call, which overrides
+the default. `space: "all"` is the escape hatch: it searches every space the key can reach plus the
+legacy wiki.
+
+Precedence is **explicit per-call `space` → `THREDZ_DEFAULT_SPACE` → unspaced (legacy wiki)**.
+
+Two deliberate behaviours worth knowing:
+
+- **Inside a space, `visibility` is not sent.** The space's type decides it, and the API would
+  overwrite whatever we sent — so `wiki_write` omits it and notes that in its result.
+- **An update never moves an article between spaces by accident.** A defaulted space is applied to
+  reads and to *creates*, but a `PATCH` only carries a space you named explicitly — exactly the
+  guard `visibility` already had.
+
+Note that a space-typed `shared` space is **narrower** than the legacy `visibility: "shared"`,
+which is readable by *every Thredz account*, not just yours.
 
 ### Goals & tasks
 

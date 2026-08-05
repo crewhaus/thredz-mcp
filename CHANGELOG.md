@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-08-05
+
+Wiki **spaces** — account-internal memory boundaries, and the mechanism behind per-agent private
+memory in a multi-agent crew. 27 tools total.
+
+### Added
+
+- **`THREDZ_DEFAULT_SPACE`** scopes every wiki call to one space. Precedence is explicit per-call
+  `space` → `THREDZ_DEFAULT_SPACE` → unspaced (the legacy account-wide wiki). The literal `"all"`
+  (or `"*"`) is the escape hatch back to "every accessible space plus the legacy wiki", which is
+  what the API does when no space is sent.
+
+- **A `space` parameter on every wiki tool** — `wiki_recall`, `wiki_semantic_search` (in the body;
+  it's a POST), `wiki_search`, `wiki_get`, `wiki_write`, `wiki_list`, `wiki_related`,
+  `wiki_set_signals` (on the query — the space scopes which article the slug resolves to) and
+  `wiki_stats`. Every schema is `additionalProperties: false`, so this had to be declared to be
+  reachable at all.
+
+- **`wiki_space_list` and `wiki_space_create`** (2 new tools). `wiki_space_list` reports usage
+  against the plan's caps so an agent can see it is at the limit before trying. `wiki_space_create`
+  takes `shared` (every key on the account) or `individual` (this key only). `PATCH`/`DELETE` are
+  deliberately **not** exposed: deletion requires an already-empty space, and `PATCH` with
+  `ownerKeyId` transfers another key's private memory.
+
+- **Remediation text for the four space failures** — `402 space_quota_exceeded`,
+  `409 individual_space_exists` (names the one-space-per-key limit and points at the real fix: a
+  second API key), `409 ambiguous_article_slug` (the error a spaces-unaware agent hits most), and
+  `404 space_not_found` (which is also the answer for a space owned by another key, so the text is
+  careful not to claim the space does not exist). `402` on a Free/Starter plan now says spaces are
+  Pro/Scale only.
+
+### Changed
+
+- **`wiki_write`'s upsert probe now carries the same space as the write.** Unspaced, a slug living
+  in several accessible spaces answers `409 ambiguous_article_slug` — the probe would fall through
+  to a create that then collides, or resolve an article in a *different* space and patch the wrong
+  one. This was the sharpest edge in adding spaces.
+
+- **Creates inside a space no longer send `visibility`.** The space's type decides it and the API
+  overwrites anything sent, so sending a value only misleads; `wiki_write` says so in its result
+  when a caller passed one anyway. Unspaced creates are unchanged — still `private` by default.
+
+- **Updates never move an article between spaces implicitly.** A defaulted space applies to reads
+  and creates, but a `PATCH` only carries a space the caller named, mirroring the guard
+  `visibility` already had. Without this, setting `THREDZ_DEFAULT_SPACE` would silently migrate
+  every legacy article the agent touched.
+
+- `wiki_list` now requests `spaceSlug`, so a cross-space listing says which space each hit came
+  from. The API omits the key entirely on legacy unspaced articles — absent reads as "no space".
+
+- `THREDZ_DEFAULT_VISIBILITY` is **not** deprecated: it still governs the unspaced wiki, which is
+  the Free/Starter path. It simply has no effect once a space is in play.
+
 ## [0.2.0] — 2026-07-13
 
 The CrewHaus v0.3.0 "memory release" integration surface: goals/tasks tools, safe-by-default

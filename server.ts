@@ -47,6 +47,15 @@
  *                              own API defaults to shared (readable by every
  *                              account); this server defaults to private so
  *                              agent memory is never public by accident.
+ *                              Applies ONLY when no space is in effect — inside
+ *                              a space the space's type decides visibility.
+ *   THREDZ_DEFAULT_SPACE       optional — slug or id of a Pro/Scale wiki space
+ *                              to scope every wiki call to. A `shared` space is
+ *                              visible to every wiki-enabled key on the account;
+ *                              an `individual` space only to its owner key. One
+ *                              individual space per key is the hard API limit,
+ *                              so per-agent private memory means one key — and
+ *                              one server process — per agent.
  *
  * IMPORTANT: stdout carries ONLY JSON-RPC frames. Everything diagnostic goes
  * to stderr, or the MCP handshake breaks.
@@ -62,6 +71,24 @@ const API_KEY = process.env.THREDZ_API_KEY ?? "";
 // (readable by EVERY Thredz account). Agent memory must be private unless the
 // caller explicitly opts out per write or via THREDZ_DEFAULT_VISIBILITY.
 const DEFAULT_VISIBILITY = process.env.THREDZ_DEFAULT_VISIBILITY === "shared" ? "shared" : "private";
+
+// Pro/Scale wiki spaces. A space is an account-internal memory boundary: a
+// `shared` space is readable by every wiki-enabled key on the account, an
+// `individual` space only by the single key that owns it (one per key — that
+// limit is why per-agent private memory needs one key per agent).
+//
+// Precedence, deliberately: an explicit per-call `space` wins; else this
+// default; else the call is unspaced and hits the legacy wiki. The literal
+// "all" / "*" is the escape hatch back to "legacy wiki + every accessible
+// space", which is what the API does when no space is sent.
+const DEFAULT_SPACE = (process.env.THREDZ_DEFAULT_SPACE ?? "").trim();
+
+function spaceOf(a: Json): string | undefined {
+  const explicit = typeof a.space === "string" ? a.space.trim() : "";
+  const chosen = explicit || DEFAULT_SPACE;
+  if (!chosen || chosen === "all" || chosen === "*") return undefined;
+  return chosen;
+}
 
 // Resolved from package.json so serverInfo can never drift from the published
 // version again. Works from the built bin (dist/server.js — package.json one
@@ -152,7 +179,16 @@ function remediation(r: ThredzResponse): string | null {
   if (r.status === 403) return "Thredz rejected this API key — check THREDZ_API_KEY for typos or regenerate the key";
   if (r.status === 402 && code === "quota_exceeded")
     return "Thredz plan limit reached — the write was NOT saved. Upgrade the plan (or clear unused items) at https://thredz.crewhaus.ai";
-  if (r.status === 402) return "this capability needs a higher Thredz plan — see https://thredz.crewhaus.ai";
+  if (r.status === 402 && code === "space_quota_exceeded")
+    return "this account is at its wiki-space cap — the space was NOT created. Pro allows 5 shared spaces, Scale 25; call wiki_space_list to see current usage against the limits, then reuse a space or upgrade at https://thredz.crewhaus.ai";
+  if (r.status === 402)
+    return "this capability needs a higher Thredz plan — wiki spaces in particular are Pro and Scale only, so on Free or Starter use the unspaced wiki instead. See https://thredz.crewhaus.ai";
+  if (r.status === 409 && code === "individual_space_exists")
+    return "this API key already owns an individual space, and one per key is a hard limit — write into the existing one, or give this agent its OWN Thredz key (a second key means a second private space, which is how per-agent memory is meant to work)";
+  if (r.status === 409 && code === "ambiguous_article_slug")
+    return "this slug exists in more than one space you can read — pass `space` to say which one you mean, or use the article id";
+  if (r.status === 404 && code === "space_not_found")
+    return "no accessible space by that slug or id — note this is also the answer for a space that exists but belongs to another key, so it does not prove the space is absent. Call wiki_space_list to see what this key can actually reach";
   if (r.status === 429) return `Thredz rate limit hit — retry after ${r.retryAfter ?? "a few"} seconds`;
   if (r.status === 409 && code === "stale_article_version")
     return "the article changed under you (stale version) — re-read it with wiki_get, then re-apply your edit";
@@ -169,22 +205,23 @@ function present(label: string, r: ThredzResponse): ToolResult {
 const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
   // --- Recall (what the agent calls on every query) ---
   async wiki_recall(a) {
-    const r = await thredz("GET", "/wiki/context", { query: { q: a.query, limit: a.limit ?? 6 } });
+    const r = await thredz("GET", "/wiki/context", { query: { q: a.query, limit: a.limit ?? 6, space: spaceOf(a) } });
     return present("wiki_recall", r);
   },
   async wiki_semantic_search(a) {
+    // Semantic search is a POST — the space rides in the body, not the query.
     const r = await thredz("POST", "/wiki/search/semantic", {
-      body: { query: a.query, limit: a.limit ?? 6, minScore: a.minScore ?? 0.05 },
+      body: { query: a.query, limit: a.limit ?? 6, minScore: a.minScore ?? 0.05, space: spaceOf(a) },
     });
     return present("wiki_semantic_search", r);
   },
   async wiki_search(a) {
-    const r = await thredz("GET", "/wiki/search", { query: { q: a.query } });
+    const r = await thredz("GET", "/wiki/search", { query: { q: a.query, space: spaceOf(a) } });
     return present("wiki_search", r);
   },
   async wiki_get(a) {
     const r = await thredz("GET", `/wiki/articles/${encodeURIComponent(String(a.slug))}`, {
-      query: { concise: a.concise ?? undefined },
+      query: { concise: a.concise ?? undefined, space: spaceOf(a) },
     });
     return present("wiki_get", r);
   },
@@ -195,6 +232,14 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
     if (!slug) return { text: "wiki_write requires a `slug`", isError: true };
     const explicitVisibility =
       a.visibility === "private" || a.visibility === "shared" ? (a.visibility as string) : undefined;
+    // The space in effect for this write. `space` is the resolved value used to
+    // scope the upsert probe and the create; `explicitSpace` is set only when
+    // the CALLER named one. The distinction matters on PATCH: injecting a
+    // defaulted space into an update MOVES the article between spaces, so an
+    // update only ever carries a space the caller asked for — exactly the guard
+    // `explicitVisibility` gives visibility.
+    const space = spaceOf(a);
+    const explicitSpace = typeof a.space === "string" && a.space.trim() ? space : undefined;
     const fields: Json = {
       title: a.title,
       slug,
@@ -206,9 +251,13 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
       confidenceScore: a.confidenceScore,
       editMessage: a.editMessage ?? "agent update",
     };
-    // Upsert: does the slug already exist?
+    // Upsert: does the slug already exist? The probe MUST carry the same space
+    // as the write. Unspaced, a slug living in several accessible spaces answers
+    // 409 ambiguous_article_slug — the probe would fall through to a create that
+    // then collides, or worse resolve an article in a different space and patch
+    // the wrong one.
     const existing = await thredz("GET", `/wiki/articles/${encodeURIComponent(slug)}`, {
-      query: { fields: "id,slug,version" },
+      query: { fields: "id,slug,version", space },
     });
     if (existing.ok) {
       // The article may be returned bare or wrapped as { article: {...} };
@@ -219,16 +268,30 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
       const art = ((doc.article as Json) ?? doc) as Json;
       const version = art.version;
       const r = await thredz("PATCH", `/wiki/articles/${encodeURIComponent(slug)}`, {
-        body: { ...fields, ...(explicitVisibility ? { visibility: explicitVisibility } : {}), version },
+        body: {
+          ...fields,
+          ...(explicitVisibility ? { visibility: explicitVisibility } : {}),
+          ...(explicitSpace ? { space: explicitSpace } : {}),
+          version,
+        },
       });
-      return present(`wiki_write (updated ${slug})`, r);
+      const moved = explicitSpace ? ` → space ${explicitSpace}` : "";
+      return present(`wiki_write (updated ${slug}${moved})`, r);
     }
-    // Creates always carry a visibility: caller's choice, else the server-safe
-    // default (private) — never the Thredz API's shared-by-default.
+    // Creates inside a space take their visibility FROM the space's type — the
+    // server overwrites any visibility we send — so sending one would only
+    // mislead. Unspaced creates still always carry a visibility: caller's
+    // choice, else the server-safe default (private), never the Thredz API's
+    // shared-by-default.
     const r = await thredz("POST", "/wiki/articles", {
-      body: { ...fields, visibility: explicitVisibility ?? DEFAULT_VISIBILITY },
+      body: space
+        ? { ...fields, space }
+        : { ...fields, visibility: explicitVisibility ?? DEFAULT_VISIBILITY },
     });
-    return present(`wiki_write (created ${slug}, ${explicitVisibility ?? DEFAULT_VISIBILITY})`, r);
+    const scope = space
+      ? `space ${space}${explicitVisibility ? " — ⚠ visibility ignored; the space's type decides it" : ""}`
+      : (explicitVisibility ?? DEFAULT_VISIBILITY);
+    return present(`wiki_write (created ${slug}, ${scope})`, r);
   },
 
   // --- Reflection helpers ---
@@ -242,25 +305,54 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
         sort: a.sort ?? "updated",
         order: a.order ?? "asc",
         limit: a.limit ?? 25,
-        fields: "slug,title,tags,updatedAt,daysSinceUpdate,verified,confidenceScore,version",
+        space: spaceOf(a),
+        // spaceSlug rides along so a cross-space listing says which space each
+        // hit came from. The API omits these keys entirely on legacy unspaced
+        // articles, so "absent" reads as "not in a space".
+        fields: "slug,title,tags,updatedAt,daysSinceUpdate,verified,confidenceScore,version,spaceSlug",
       },
     });
     return present("wiki_list", r);
   },
   async wiki_related(a) {
-    const r = await thredz("GET", `/wiki/articles/${encodeURIComponent(String(a.slug))}/related`);
+    const r = await thredz("GET", `/wiki/articles/${encodeURIComponent(String(a.slug))}/related`, {
+      query: { space: spaceOf(a) },
+    });
     return present("wiki_related", r);
   },
   async wiki_set_signals(a) {
     const body: Json = {};
     if (a.verified !== undefined) body.verified = a.verified;
     if (a.confidenceScore !== undefined) body.confidenceScore = a.confidenceScore;
-    const r = await thredz("PATCH", `/wiki/articles/${encodeURIComponent(String(a.slug))}/signals`, { body });
+    // The space scopes which article the slug resolves to, so it belongs on the
+    // query — the body here is strictly the signal fields.
+    const r = await thredz("PATCH", `/wiki/articles/${encodeURIComponent(String(a.slug))}/signals`, {
+      query: { space: spaceOf(a) },
+      body,
+    });
     return present("wiki_set_signals", r);
   },
-  async wiki_stats() {
-    const r = await thredz("GET", "/wiki/stats");
+  async wiki_stats(a) {
+    const r = await thredz("GET", "/wiki/stats", { query: { space: spaceOf(a) } });
     return present("wiki_stats", r);
+  },
+
+  // --- Spaces (Pro/Scale — account-internal memory boundaries) ---
+  async wiki_space_list() {
+    const r = await thredz("GET", "/wiki/spaces");
+    return present("wiki_space_list", r);
+  },
+  async wiki_space_create(a) {
+    const type = a.type === "individual" ? "individual" : "shared";
+    const r = await thredz("POST", "/wiki/spaces", {
+      body: {
+        name: a.name,
+        slug: a.slug,
+        type,
+        description: a.description,
+      },
+    });
+    return present(`wiki_space_create (${type})`, r);
   },
 
   // --- Knowledge-gap logging (drives "learn what to learn") ---
@@ -494,22 +586,22 @@ const TOOLS = [
     name: "wiki_recall",
     description:
       "PRIMARY RECALL. Fetch the most relevant slice of the expert's own wiki for a query — a combined keyword + semantic-vector context bundle. Call this FIRST on every user question before answering.",
-    inputSchema: s({ query: str("what to recall about"), limit: num("max snippets (default 6)") }, ["query"]),
+    inputSchema: s({ query: str("what to recall about"), limit: num("max snippets (default 6)"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
   },
   {
     name: "wiki_semantic_search",
     description: "Vector/semantic search over the wiki. Use when a query is conceptual and keyword search would miss paraphrases.",
-    inputSchema: s({ query: str("natural-language query"), limit: num("max results (default 6)"), minScore: num("similarity floor 0–1 (default 0.05)") }, ["query"]),
+    inputSchema: s({ query: str("natural-language query"), limit: num("max results (default 6)"), minScore: num("similarity floor 0–1 (default 0.05)"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
   },
   {
     name: "wiki_search",
     description: "Keyword/full-text search over the wiki with scored snippets. Use for exact terms, names, numbers.",
-    inputSchema: s({ query: str("keyword query") }, ["query"]),
+    inputSchema: s({ query: str("keyword query"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
   },
   {
     name: "wiki_get",
     description: "Read one wiki article in full by its slug (e.g. after a search returns a promising hit).",
-    inputSchema: s({ slug: str("article slug"), concise: bool("trim to essentials") }, ["slug"]),
+    inputSchema: s({ slug: str("article slug"), concise: bool("trim to essentials"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
   },
   {
     name: "wiki_write",
@@ -551,18 +643,40 @@ const TOOLS = [
   {
     name: "wiki_related",
     description: "Find articles related to a slug by tags + semantic similarity. Use in reflection to detect duplicates or contradictions to reconcile.",
-    inputSchema: s({ slug: str("article slug") }, ["slug"]),
+    inputSchema: s({ slug: str("article slug"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
   },
   {
     name: "wiki_set_signals",
     description:
       "Set quality signals on an article after verification: `verified` (fact-checked against a primary source) and/or `confidenceScore` (0–1). Use in reflection to promote or demote knowledge.",
-    inputSchema: s({ slug: str("article slug"), verified: bool("fact-checked"), confidenceScore: num("0–1") }, ["slug"]),
+    inputSchema: s({ slug: str("article slug"), verified: bool("fact-checked"), confidenceScore: num("0–1"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
   },
   {
     name: "wiki_stats",
     description: "Corpus health: article/category/tag/version counts. Useful in a reflection summary.",
+    inputSchema: s({ space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }),
+  },
+  {
+    name: "wiki_space_list",
+    description:
+      "List the wiki spaces this API key can reach, with current usage against the plan's caps. A `shared` space is readable by every wiki-enabled key on the account; an `individual` space only by the key that owns it. Call this before creating a space, and to find the slug to pass as `space`. Spaces are a Pro/Scale feature.",
     inputSchema: s({}),
+    annotations: { title: "List wiki spaces", readOnlyHint: true },
+  },
+  {
+    name: "wiki_space_create",
+    description:
+      "Create a wiki space. Use `shared` for memory the whole crew should read, `individual` for this key's own private corpus. IMPORTANT: a key may own only ONE individual space — a second attempt fails with individual_space_exists, and the fix is to give the other agent its own Thredz API key. Consumes plan quota; call wiki_space_list first.",
+    inputSchema: s(
+      {
+        name: str("human-readable space name"),
+        slug: str("stable kebab-case identifier (optional — derived from the name)"),
+        type: str("'shared' (every key on the account, default) | 'individual' (this key only)"),
+        description: str("what belongs in this space"),
+      },
+      ["name"],
+    ),
+    annotations: { title: "Create wiki space", destructiveHint: true },
   },
   {
     name: "log_knowledge_gap",
@@ -821,7 +935,14 @@ async function handle(msg: Json): Promise<void> {
 }
 
 async function main() {
-  log(`ready — API_BASE=${API_BASE} key=${API_KEY ? "set" : "MISSING"}`);
+  // The space is reported but deliberately NOT validated over HTTP here: the
+  // smoke gate boots this server with an empty key and asserts stdout is pure
+  // JSON-RPC, so boot must stay I/O-free. A bad slug surfaces lazily as
+  // space_not_found, which carries its own remediation.
+  log(
+    `ready — API_BASE=${API_BASE} key=${API_KEY ? "set" : "MISSING"}` +
+      (DEFAULT_SPACE ? ` space=${DEFAULT_SPACE}` : ` visibility=${DEFAULT_VISIBILITY}`),
+  );
   const decoder = new TextDecoder();
   let buf = "";
   // Read newline-delimited JSON-RPC frames from stdin. `process.stdin` is an
