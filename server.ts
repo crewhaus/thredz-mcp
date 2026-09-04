@@ -315,7 +315,14 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
       ? `space ${space}${explicitVisibility ? " — ⚠ visibility ignored; the space's type decides it" : ""}`
       : (explicitVisibility ?? DEFAULT_VISIBILITY);
     const shadow = shadowsPublic ? " — shadows the public help page inside this account" : "";
-    return present(`wiki_write (created ${slug}, ${scope}${shadow})`, r);
+    const written = present(`wiki_write (created ${slug}, ${scope}${shadow})`, r);
+    // `present` only shows its label on failure, so on the happy path the model
+    // would never learn that this was a create-a-shadow rather than an edit of
+    // the page it just read. Say so explicitly.
+    if (r.ok && shadowsPublic) {
+      written.text = `Created this account's own \`${slug}\`, which now shadows the read-only platform help page here. The help page itself is unchanged, and other accounts still see it.\n${written.text}`;
+    }
+    return written;
   },
 
   // --- Reflection helpers ---

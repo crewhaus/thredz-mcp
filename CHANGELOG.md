@@ -15,6 +15,11 @@ unchanged (27).
 
 ### Changed
 
+- **BREAKING: `wiki_write` and `wiki_set_signals` now require a `justification`.** One concrete
+  sentence (>= 16 chars) on why the write serves the caller's current task. It is consumed by
+  justification-gated client runtimes (e.g. CrewHaus's intent gate); the Thredz server itself
+  ignores it and it is never sent. Because every schema is `additionalProperties: false` and this
+  field is in `required`, a client that omits it gets a schema rejection before the handler runs.
 - **`THREDZ_DEFAULT_VISIBILITY` now governs slug precedence, not exposure.** It still defaults to
   `private` so existing setups behave exactly as before, and it is still ignored inside a space.
   The README, the `wiki_write` schema text and the source comments no longer describe `shared` as
@@ -22,8 +27,11 @@ unchanged (27).
 - **`wiki_write` no longer tries to patch the platform help page.** Its upsert probe now asks for
   `visibility`; a hit on a `public` page is treated as a miss and falls through to a create, which
   is the API's documented way to adapt the page (your article shadows it inside your account). The
-  create result says when it shadowed the help page. Passing `visibility: "public"` explicitly opts
-  back into the patch, which is how an operator key edits the page.
+  create result opens with a line saying the write created this account's own shadowing copy and
+  left the help page untouched — `present()` only surfaces its label on failure, so without that
+  line the model would never learn the write was a create rather than an edit of the page it just
+  read. Passing `visibility: "public"` explicitly opts back into the patch, which is how an
+  operator key edits the page.
 - **`visibility: "public"` is passed through instead of silently dropped**, so a tenant key gets
   the API's `403 public_visibility_forbidden` (with remediation) rather than an unexpected private
   article.
