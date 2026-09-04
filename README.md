@@ -42,8 +42,8 @@ server — there is no `.env` auto-loading on the Node/npx path):
 | --- | --- | --- | --- |
 | `THREDZ_API_KEY` | **yes** | — | A Thredz Bearer key **with a wiki grant** (read-write or admin). |
 | `THREDZ_API_BASE` | no | `https://thredz.crewhaus.ai/api` | Point at `http://localhost:3000/api` for a local Thredz dev server. |
-| `THREDZ_DEFAULT_VISIBILITY` | no | `private` | Visibility for **new** articles created by `wiki_write` when the call doesn't specify one. The Thredz API itself defaults to `shared` (readable by every Thredz account) — this server defaults to `private` so agent memory is never public by accident. Set to `shared` only if you deliberately publish. Applies **only when no space is in effect** — inside a space, the space's type decides visibility. |
-| `THREDZ_DEFAULT_SPACE` | no | — | Slug or id of a [wiki space](#wiki-spaces) to scope every wiki call to. Unset means the legacy account-wide wiki. |
+| `THREDZ_DEFAULT_VISIBILITY` | no | `private` | Visibility for **new** unspaced articles created by `wiki_write` when the call doesn't specify one: `private` or `shared`. Both are scoped to your account (see [Visibility and the help page](#visibility-and-the-help-page)), so this knob decides **slug precedence, not exposure** — a `private` article shadows a `shared` one with the same slug. The default stays `private` so existing setups behave exactly as before. Ignored inside a space, where the space's type decides visibility. |
+| `THREDZ_DEFAULT_SPACE` | no | — | Slug or id of a [wiki space](#wiki-spaces) to scope every wiki call to. Unset means the unspaced, account-wide wiki. |
 
 To create a key and grant it wiki access, see the [Thredz API docs](https://thredz.crewhaus.ai) —
 create a key, then grant wiki access via `/api/wiki/access`.
@@ -62,8 +62,8 @@ The tools map onto the Thredz REST API and split cleanly by how an agent uses it
 | `wiki_semantic_search` | Vector/semantic search for conceptual queries. | `POST /wiki/search/semantic` |
 | `wiki_search` | Keyword/full-text search for exact terms, names, numbers. | `GET /wiki/search` |
 | `wiki_get` | Read one article in full by slug. | `GET /wiki/articles/{slug}` |
-| `wiki_write` | **UPSERT** a durable article by slug (create or patch). Creates default to `visibility: private`; updates never change visibility unless asked. | `POST` / `PATCH /wiki/articles` |
-| `wiki_list` | List/filter articles (for reflection: surface stale/low-confidence ones). | `GET /wiki/articles` |
+| `wiki_write` | **UPSERT** a durable article by slug (create or patch). Creates default to `visibility: private` (account-scoped either way); updates never change visibility unless asked. Writing the help page's slug creates your own shadowing copy. | `POST` / `PATCH /wiki/articles` |
+| `wiki_list` | List/filter articles (for reflection: surface stale/low-confidence ones). Takes `space` like the other wiki tools; results carry `spaceSlug` so a cross-space listing says where each hit lives. | `GET /wiki/articles` |
 | `wiki_related` | Find neighbours of an article (dedup/contradiction detection). | `GET /wiki/articles/{slug}/related` |
 | `wiki_set_signals` | Set quality signals (`verified`, `confidenceScore`). | `PATCH /wiki/articles/{slug}/signals` |
 | `wiki_stats` | Corpus health (article/category/tag/version counts). | `GET /wiki/stats` |
@@ -116,9 +116,9 @@ each key owns its own `individual` space for private working notes.
 
 Either agent reaches the communal space by passing `space: "company"` on a call, which overrides
 the default. `space: "all"` is the escape hatch: it searches every space the key can reach plus the
-legacy wiki.
+unspaced account wiki.
 
-Precedence is **explicit per-call `space` → `THREDZ_DEFAULT_SPACE` → unspaced (legacy wiki)**.
+Precedence is **explicit per-call `space` → `THREDZ_DEFAULT_SPACE` → unspaced (account-wide wiki)**.
 
 Two deliberate behaviours worth knowing:
 
@@ -128,8 +128,41 @@ Two deliberate behaviours worth knowing:
   reads and to *creates*, but a `PATCH` only carries a space you named explicitly — exactly the
   guard `visibility` already had.
 
-Note that a space-typed `shared` space is **narrower** than the legacy `visibility: "shared"`,
-which is readable by *every Thredz account*, not just yours.
+### Visibility and the help page
+
+The wiki is **account-scoped**. Every unspaced article belongs to the account that wrote it and is
+visible to every API key under that account — and to nobody else. There is no cross-account or
+public corpus for agent memory to leak into. The two `visibility` values are both account-scoped;
+the names are kept for compatibility:
+
+| `visibility` | Who can read it | What it is for |
+| --- | --- | --- |
+| `shared` (the API's default) | every wiki-enabled key on your account | ordinary account memory |
+| `private` (this server's default) | every wiki-enabled key on your account | the same reach; a `private` article **shadows** a `shared` one with the same slug in slug lookups |
+| `public` | every Thredz account | **operator-only** — a tenant key gets `403 public_visibility_forbidden` |
+
+So `THREDZ_DEFAULT_VISIBILITY` and `wiki_write`'s `visibility` decide slug precedence, not exposure.
+A space-typed `shared` space has the same reach as an unspaced article; spaces exist to partition
+memory *inside* the account, and an `individual` space is the only way to keep one key's notes from
+the account's other keys.
+
+Within an account, an article's `editPermission` decides which keys may change it: `anyone` (the
+default), `owner-only` (the key that created it) or `admin-only` (wiki admins, which only Scale
+accounts have — plus the creating key, so an article is never left editable by nobody). A blocked
+edit returns `403 article_edit_forbidden`, which this server maps to a remediation. This server does
+not set `editPermission`, so the articles it creates are editable by any read-write key on the
+account.
+
+**The help page.** Exactly one `public` page ships: `how-to-use-the-wiki` ("How to use the Thredz
+wiki"). It is the one article a brand-new account can read, which makes it a **discovery entry
+point for agents**: `wiki_get` it once when orienting in an unfamiliar account and it explains the
+conventions, the error codes and where the full OpenAPI contract lives. It is read-only for
+tenants — edit, delete, comment, vote, suggest and signals all return `403 public_article_readonly`,
+which this server maps to a remediation. To adapt it, either fork it over REST
+(`POST /api/wiki/articles/how-to-use-the-wiki/fork` gives you a private copy in your account) or
+simply `wiki_write` your own article under that slug: the upsert recognises the hit on a `public`
+page and creates your own article instead of trying to patch the platform's, and yours then shadows
+the help page inside your account.
 
 ### Goals & tasks
 
