@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Tracks the Thredz wiki's move to an **account-scoped tenancy model**: every unspaced article now
+belongs to the account that wrote it and is visible to every API key under that account — and to
+nobody else. `shared` and `private` are both account-scoped (the names are kept for compatibility;
+`private` still shadows `shared` on slug lookup), and the only cross-account page is the
+operator-published help page `how-to-use-the-wiki` (`visibility: "public"`). Tool count is
+unchanged (27).
+
+### Changed
+
+- **`THREDZ_DEFAULT_VISIBILITY` now governs slug precedence, not exposure.** It still defaults to
+  `private` so existing setups behave exactly as before, and it is still ignored inside a space.
+  The README, the `wiki_write` schema text and the source comments no longer describe `shared` as
+  "readable by every Thredz account" — it is not.
+- **`wiki_write` no longer tries to patch the platform help page.** Its upsert probe now asks for
+  `visibility`; a hit on a `public` page is treated as a miss and falls through to a create, which
+  is the API's documented way to adapt the page (your article shadows it inside your account). The
+  create result says when it shadowed the help page. Passing `visibility: "public"` explicitly opts
+  back into the patch, which is how an operator key edits the page.
+- **`visibility: "public"` is passed through instead of silently dropped**, so a tenant key gets
+  the API's `403 public_visibility_forbidden` (with remediation) rather than an unexpected private
+  article.
+- `wiki_get` names the help page as the discovery entry point for an agent orienting in an
+  unfamiliar account.
+- Tool text and comments say "unspaced account wiki" where they said "legacy wiki".
+
+### Added
+
+- Remediation text for three 403 codes that previously fell through to the generic "check your
+  API key" line: `public_article_readonly` (fork it, or write your own article under the slug),
+  `public_visibility_forbidden` (use `shared`/`private`), and `article_edit_forbidden` (the
+  article's `editPermission` blocks this key — `owner-only` means the key that created it).
+
+### Fixed
+
+- **`wiki_list` and `wiki_write` now declare `space` in their schemas.** Both handlers had read a
+  `space` argument since 0.3.0, but neither property was ever advertised — and every schema is
+  `additionalProperties: false`, so a client passing one had it rejected before the handler ran.
+  0.3.0's claim of "a `space` parameter on every wiki tool" was therefore only true of the seven
+  tools that declared it. `wiki_list` could not be scoped to a space at all, and in `wiki_write`
+  the whole `explicitSpace` path was unreachable: a caller could not place a create in a chosen
+  space, nor move an article between spaces, and `THREDZ_DEFAULT_SPACE` was the only reachable
+  way to scope a write. `wiki_write`'s parameter is documented with its create-vs-update
+  semantics, since naming a space on an update moves the article.
+
 ## [0.3.0] — 2026-08-05
 
 Wiki **spaces** — account-internal memory boundaries, and the mechanism behind per-agent private

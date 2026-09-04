@@ -42,13 +42,15 @@
  * definition, e.g. the `env` block of a claude_desktop_config.json entry):
  *   THREDZ_API_KEY             required — a Bearer key with a wiki grant
  *   THREDZ_API_BASE            optional — default https://thredz.crewhaus.ai/api
- *   THREDZ_DEFAULT_VISIBILITY  optional — visibility for NEW articles created by
- *                              wiki_write: private (default) | shared. Thredz's
- *                              own API defaults to shared (readable by every
- *                              account); this server defaults to private so
- *                              agent memory is never public by accident.
- *                              Applies ONLY when no space is in effect — inside
- *                              a space the space's type decides visibility.
+ *   THREDZ_DEFAULT_VISIBILITY  optional — visibility for NEW unspaced articles
+ *                              created by wiki_write: private (default) | shared.
+ *                              Both are scoped to your account (every key under
+ *                              the account, nobody else); the names are kept for
+ *                              compatibility. The only difference is slug
+ *                              precedence — a private article shadows a shared
+ *                              one with the same slug — so this knob affects
+ *                              shadowing, not exposure. Ignored inside a space,
+ *                              where the space's type decides visibility.
  *   THREDZ_DEFAULT_SPACE       optional — slug or id of a Pro/Scale wiki space
  *                              to scope every wiki call to. A `shared` space is
  *                              visible to every wiki-enabled key on the account;
@@ -67,9 +69,12 @@ import { fileURLToPath } from "node:url";
 const API_BASE = (process.env.THREDZ_API_BASE ?? "https://thredz.crewhaus.ai/api").replace(/\/+$/, "");
 const API_KEY = process.env.THREDZ_API_KEY ?? "";
 
-// Safe-by-default: the Thredz API itself defaults new articles to "shared"
-// (readable by EVERY Thredz account). Agent memory must be private unless the
-// caller explicitly opts out per write or via THREDZ_DEFAULT_VISIBILITY.
+// Visibility of NEW unspaced articles. The wiki is account-scoped: `shared`
+// (the API's default) and `private` are BOTH visible only to keys under your
+// account, and differ only in slug precedence (private shadows shared). This
+// server keeps `private` as its default so upgrades change nothing; the knob
+// affects shadowing, not exposure. `public` exists but is operator-only — a
+// tenant key gets 403 public_visibility_forbidden — so it is never a default.
 const DEFAULT_VISIBILITY = process.env.THREDZ_DEFAULT_VISIBILITY === "shared" ? "shared" : "private";
 
 // Pro/Scale wiki spaces. A space is an account-internal memory boundary: a
@@ -78,9 +83,9 @@ const DEFAULT_VISIBILITY = process.env.THREDZ_DEFAULT_VISIBILITY === "shared" ? 
 // limit is why per-agent private memory needs one key per agent).
 //
 // Precedence, deliberately: an explicit per-call `space` wins; else this
-// default; else the call is unspaced and hits the legacy wiki. The literal
-// "all" / "*" is the escape hatch back to "legacy wiki + every accessible
-// space", which is what the API does when no space is sent.
+// default; else the call is unspaced and hits the account-wide wiki. The
+// literal "all" / "*" is the escape hatch back to "unspaced wiki + every
+// accessible space", which is what the API does when no space is sent.
 const DEFAULT_SPACE = (process.env.THREDZ_DEFAULT_SPACE ?? "").trim();
 
 function spaceOf(a: Json): string | undefined {
@@ -176,6 +181,12 @@ function remediation(r: ThredzResponse): string | null {
     return "this Thredz API key is disabled — usually a lapsed subscription. Fix billing at https://thredz.crewhaus.ai (Account → Billing); the agent keeps running, but Thredz-backed memory is unavailable until the key is re-enabled";
   if (r.status === 403 && /^wiki_(access|permission)_required$/.test(code))
     return "this key has no (or too low a) wiki grant — give it read-write wiki access in the Thredz account portal";
+  if (r.status === 403 && code === "public_article_readonly")
+    return "this is a platform help page (visibility: public) and is read-only for every tenant key — to adapt it, POST /wiki/articles/{slug}/fork for your own copy, or wiki_write your own article under the same slug (yours then shadows the public page inside your account)";
+  if (r.status === 403 && code === "public_visibility_forbidden")
+    return "only the platform operator can publish `public` articles — use `shared` or `private`; both are scoped to your account, and `private` merely wins slug lookups";
+  if (r.status === 403 && code === "article_edit_forbidden")
+    return "this article's editPermission (owner-only or admin-only) does not let this key change it — another key in your account created it; ask that key or a wiki admin to edit it, or write under a different slug";
   if (r.status === 403) return "Thredz rejected this API key — check THREDZ_API_KEY for typos or regenerate the key";
   if (r.status === 402 && code === "quota_exceeded")
     return "Thredz plan limit reached — the write was NOT saved. Upgrade the plan (or clear unused items) at https://thredz.crewhaus.ai";
@@ -230,8 +241,13 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
   async wiki_write(a) {
     const slug = String(a.slug ?? "").trim();
     if (!slug) return { text: "wiki_write requires a `slug`", isError: true };
+    // `public` is passed through deliberately: it is operator-only, and a
+    // tenant key should get the API's clear 403 public_visibility_forbidden
+    // (which carries a remediation) rather than a silent downgrade to private.
     const explicitVisibility =
-      a.visibility === "private" || a.visibility === "shared" ? (a.visibility as string) : undefined;
+      a.visibility === "private" || a.visibility === "shared" || a.visibility === "public"
+        ? (a.visibility as string)
+        : undefined;
     // The space in effect for this write. `space` is the resolved value used to
     // scope the upsert probe and the create; `explicitSpace` is set only when
     // the CALLER named one. The distinction matters on PATCH: injecting a
@@ -257,15 +273,22 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
     // then collides, or worse resolve an article in a different space and patch
     // the wrong one.
     const existing = await thredz("GET", `/wiki/articles/${encodeURIComponent(slug)}`, {
-      query: { fields: "id,slug,version", space },
+      query: { fields: "id,slug,version,visibility", space },
     });
-    if (existing.ok) {
-      // The article may be returned bare or wrapped as { article: {...} };
+    // The article may be returned bare or wrapped as { article: {...} }.
+    const doc = (existing.ok ? (existing.data as Json) : undefined) ?? {};
+    const art = ((doc.article as Json) ?? doc) as Json;
+    // A hit on a platform `public` page (the help page) is not ours to patch —
+    // it is read-only for tenants. The API's documented way to adapt it is to
+    // write your own article under that slug, which then shadows the public
+    // page inside your account, so treat the probe as a miss and fall through
+    // to a create. Asking for `public` explicitly opts back into the patch —
+    // that is how an operator key edits the page.
+    const shadowsPublic = existing.ok && art.visibility === "public" && explicitVisibility !== "public";
+    if (existing.ok && !shadowsPublic) {
       // `version` is required for the PATCH optimistic-concurrency check.
       // Visibility is only sent when the caller explicitly asked to change it —
-      // an update must never silently flip an article public or private.
-      const doc = (existing.data as Json) ?? {};
-      const art = ((doc.article as Json) ?? doc) as Json;
+      // an update must never silently change which slug wins in the account.
       const version = art.version;
       const r = await thredz("PATCH", `/wiki/articles/${encodeURIComponent(slug)}`, {
         body: {
@@ -280,9 +303,9 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
     }
     // Creates inside a space take their visibility FROM the space's type — the
     // server overwrites any visibility we send — so sending one would only
-    // mislead. Unspaced creates still always carry a visibility: caller's
-    // choice, else the server-safe default (private), never the Thredz API's
-    // shared-by-default.
+    // mislead. Unspaced creates always carry a visibility: the caller's choice,
+    // else DEFAULT_VISIBILITY (private). Either way the article is scoped to
+    // this account; the value only decides slug precedence.
     const r = await thredz("POST", "/wiki/articles", {
       body: space
         ? { ...fields, space }
@@ -291,7 +314,8 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
     const scope = space
       ? `space ${space}${explicitVisibility ? " — ⚠ visibility ignored; the space's type decides it" : ""}`
       : (explicitVisibility ?? DEFAULT_VISIBILITY);
-    return present(`wiki_write (created ${slug}, ${scope})`, r);
+    const shadow = shadowsPublic ? " — shadows the public help page inside this account" : "";
+    return present(`wiki_write (created ${slug}, ${scope}${shadow})`, r);
   },
 
   // --- Reflection helpers ---
@@ -307,7 +331,7 @@ const handlers: Record<string, (args: Json) => Promise<ToolResult>> = {
         limit: a.limit ?? 25,
         space: spaceOf(a),
         // spaceSlug rides along so a cross-space listing says which space each
-        // hit came from. The API omits these keys entirely on legacy unspaced
+        // hit came from. The API omits these keys entirely on unspaced
         // articles, so "absent" reads as "not in a space".
         fields: "slug,title,tags,updatedAt,daysSinceUpdate,verified,confidenceScore,version,spaceSlug",
       },
@@ -586,22 +610,23 @@ const TOOLS = [
     name: "wiki_recall",
     description:
       "PRIMARY RECALL. Fetch the most relevant slice of the expert's own wiki for a query — a combined keyword + semantic-vector context bundle. Call this FIRST on every user question before answering.",
-    inputSchema: s({ query: str("what to recall about"), limit: num("max snippets (default 6)"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
+    inputSchema: s({ query: str("what to recall about"), limit: num("max snippets (default 6)"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
   },
   {
     name: "wiki_semantic_search",
     description: "Vector/semantic search over the wiki. Use when a query is conceptual and keyword search would miss paraphrases.",
-    inputSchema: s({ query: str("natural-language query"), limit: num("max results (default 6)"), minScore: num("similarity floor 0–1 (default 0.05)"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
+    inputSchema: s({ query: str("natural-language query"), limit: num("max results (default 6)"), minScore: num("similarity floor 0–1 (default 0.05)"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
   },
   {
     name: "wiki_search",
     description: "Keyword/full-text search over the wiki with scored snippets. Use for exact terms, names, numbers.",
-    inputSchema: s({ query: str("keyword query"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
+    inputSchema: s({ query: str("keyword query"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["query"]),
   },
   {
     name: "wiki_get",
-    description: "Read one wiki article in full by its slug (e.g. after a search returns a promising hit).",
-    inputSchema: s({ slug: str("article slug"), concise: bool("trim to essentials"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
+    description:
+      "Read one wiki article in full by its slug (e.g. after a search returns a promising hit). The platform help page `how-to-use-the-wiki` is readable by every account and explains the wiki's conventions, error codes and where the full API contract lives — read it once when orienting in an unfamiliar account.",
+    inputSchema: s({ slug: str("article slug"), concise: bool("trim to essentials"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
   },
   {
     name: "wiki_write",
@@ -618,11 +643,17 @@ const TOOLS = [
         status: str("draft | published | review | archived (default published)"),
         confidenceScore: num("0–1 confidence in this knowledge"),
         editMessage: str("what changed and why"),
+        space: str(
+          "wiki space slug or id (default: the server's THREDZ_DEFAULT_SPACE; 'all' means unspaced). On a CREATE this places the article in that space, and the space's type then decides its visibility. On an UPDATE, naming a space MOVES the article into it — omit it to leave the article where it is.",
+        ),
         visibility: str(
-          "'private' (default — scoped to your account; correct for agent memory) | 'shared' (readable by EVERY Thredz account — only for deliberately public knowledge). On updates, omitting this leaves the article's visibility unchanged.",
+          "'private' (default) | 'shared' — both are scoped to your account (every key under it, no other account), so this decides slug precedence, not exposure: a private article shadows a shared one with the same slug. 'public' is operator-only; a tenant key gets 403 public_visibility_forbidden. On updates, omitting this leaves the article's visibility unchanged.",
+        ),
+        justification: str(
+          "one concrete sentence (>=16 chars) on why this write serves your current task — consumed by justification-gated client runtimes (e.g. CrewHaus's intent gate); the server itself ignores it",
         ),
       },
-      ["slug", "title", "body"],
+      ["slug", "title", "body", "justification"],
     ),
     annotations: { title: "Write wiki article", destructiveHint: true },
   },
@@ -638,23 +669,24 @@ const TOOLS = [
       sort: str("updated | created | title | relevance | popular | trending"),
       order: str("asc | desc"),
       limit: num("page size (default 25, max 100)"),
+      space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)"),
     }),
   },
   {
     name: "wiki_related",
     description: "Find articles related to a slug by tags + semantic similarity. Use in reflection to detect duplicates or contradictions to reconcile.",
-    inputSchema: s({ slug: str("article slug"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
+    inputSchema: s({ slug: str("article slug"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
   },
   {
     name: "wiki_set_signals",
     description:
       "Set quality signals on an article after verification: `verified` (fact-checked against a primary source) and/or `confidenceScore` (0–1). Use in reflection to promote or demote knowledge.",
-    inputSchema: s({ slug: str("article slug"), verified: bool("fact-checked"), confidenceScore: num("0–1"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }, ["slug"]),
+    inputSchema: s({ slug: str("article slug"), verified: bool("fact-checked"), confidenceScore: num("0–1"), space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)"), justification: str("one concrete sentence (>=16 chars) on why this signal change serves your current task — consumed by justification-gated client runtimes; the server itself ignores it") }, ["slug", "justification"]),
   },
   {
     name: "wiki_stats",
     description: "Corpus health: article/category/tag/version counts. Useful in a reflection summary.",
-    inputSchema: s({ space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the legacy wiki (default: the server's THREDZ_DEFAULT_SPACE)") }),
+    inputSchema: s({ space: str("wiki space slug or id to scope this call to; 'all' searches every accessible space plus the unspaced account wiki (default: the server's THREDZ_DEFAULT_SPACE)") }),
   },
   {
     name: "wiki_space_list",
@@ -673,8 +705,11 @@ const TOOLS = [
         slug: str("stable kebab-case identifier (optional — derived from the name)"),
         type: str("'shared' (every key on the account, default) | 'individual' (this key only)"),
         description: str("what belongs in this space"),
+        justification: str(
+          "one concrete sentence (>=16 chars) on why creating this space serves your current task — consumed by justification-gated client runtimes; the server itself ignores it",
+        ),
       },
-      ["name"],
+      ["name", "justification"],
     ),
     annotations: { title: "Create wiki space", destructiveHint: true },
   },
